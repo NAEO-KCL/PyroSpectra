@@ -1,5 +1,7 @@
 ![Logo_Colour](https://github.com/user-attachments/assets/fa9d8640-c4ef-44e6-84ef-7c18750c825e)
 
+# PyroSpectra
+
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
