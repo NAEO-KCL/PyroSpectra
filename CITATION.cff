@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
-title: "PyroSpectra"
+title: "PyroSpectra: Biomass Burning Emission Factors From FTIR Time Series Spectra"
 version: 1.0.0
 abstract: "A Python package for analyzing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy, implementing temporally regularized concentration retrievals with automated species identification."
 
