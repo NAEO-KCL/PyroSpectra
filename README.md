@@ -9,7 +9,7 @@ A Python package for analysing biomass burning emissions using closed-path Fouri
 
 ## Overview
 
-This package implements the methodology described in **Richardson-Foulger et al. (2026)** for retrieving fire emission factors from laboratory FTIR measurements. Key features include:
+<!--- This package implements the methodology described in **Richardson-Foulger et al. (2026)** for retrieving fire emission factors from laboratory FTIR measurements. Key features include: --->
 
 - **Spectral preprocessing** with optimized asymmetric least squares (O-ALS) baseline correction
 - **Reference spectra generation** using RADIS and HITRAN molecular databases
