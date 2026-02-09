@@ -1,4 +1,4 @@
-![Logo_Colour](https://github.com/user-attachments/assets/fa9d8640-c4ef-44e6-84ef-7c18750c825e)
+![439965275-fa9d8640-c4ef-44e6-84ef-7c18750c825e](https://github.com/user-attachments/assets/8f95a25d-2626-409e-bbff-8081ebb8af92)
 
 # PyroSpectra
 
