@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
-title: "FTIR Fire Emissions Analysis Package"
+title: "pyrospectra"
 version: 1.0.0
 date-released: 2026-02-09
 abstract: "A Python package for analyzing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy, implementing temporally regularized concentration retrievals with automated species identification."
@@ -9,15 +9,11 @@ authors:
   - family-names: "Richardson-Foulger"
     given-names: "Luke"
     affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
-  - family-names: "Wooster"
-    given-names: "Martin"
-    affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
+King's College London"
   - family-names: "Gómez-Dans"
     given-names: "José"
     affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
-  - family-names: "Grosvenor"
-    given-names: "Mark"
-    affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
+
 keywords:
   - FTIR spectroscopy
   - fire emissions
@@ -26,7 +22,7 @@ keywords:
   - Tikhonov regularization
   - emission factors
 license: MIT
-repository-code: "https://github.com/your-repo/ftir-fire-emissions"
+repository-code: "https://github.com/NAEO-KCL/pyrospectra"
 references:
   - type: article
     authors:
