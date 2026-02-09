@@ -253,9 +253,7 @@ If you use this software, please cite:
          Retrieval of Fire Emission Factors},
   author={Richardson-Foulger, Luke and Wooster, Martin and 
           G{\'o}mez-Dans, Jos{\'e} and Grosvenor, Mark},
-  year={2026},
-  month={February}
-}
+  year={2026}}
 ```
 
 Also cite the RADIS package used for reference spectra:
