@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "FTIR Fire Emissions Analysis Package"
+version: 1.0.0
+date-released: 2026-02-09
+abstract: "A Python package for analyzing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy, implementing temporally regularized concentration retrievals with automated species identification."
+authors:
+  - family-names: "Richardson-Foulger"
+    given-names: "Luke"
+    affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
+  - family-names: "Wooster"
+    given-names: "Martin"
+    affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
+  - family-names: "Gómez-Dans"
+    given-names: "José"
+    affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
+  - family-names: "Grosvenor"
+    given-names: "Mark"
+    affiliation: "Leverhulme Centre for Wildfires, Environment and Society, King's College London"
+keywords:
+  - FTIR spectroscopy
+  - fire emissions
+  - biomass burning
+  - atmospheric chemistry
+  - Tikhonov regularization
+  - emission factors
+license: MIT
+repository-code: "https://github.com/your-repo/ftir-fire-emissions"
+references:
+  - type: article
+    authors:
+      - family-names: "Richardson-Foulger"
+        given-names: "Luke"
+      - family-names: "Wooster"
+        given-names: "Martin"
+      - family-names: "Gómez-Dans"
+        given-names: "José"
+      - family-names: "Grosvenor"
+        given-names: "Mark"
+    title: "Use of a Closed-Path 'Industrial Emissions' FTIR Spectrometer for Close-to-Source Laboratory Sampling of Biomass Burning Smoke and Retrieval of Fire Emission Factors"
+    year: 2026
+    month: 2
+    day: 9
