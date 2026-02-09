@@ -13,9 +13,9 @@ long_description = (this_directory / "README.md").read_text()
 requirements = (this_directory / "requirements.txt").read_text().strip().split('\n')
 
 setup(
-    name="ftir_fire_emissions",
+    name="pyrospectra",
     version="1.0.0",
-    author="Luke Richardson-Foulger, Martin Wooster, José Gómez-Dans, Mark Grosvenor",
+    author="Luke Richardson-Foulger, José Gómez-Dans",
     author_email="",  # Add email if desired
     description="Analysis toolkit for biomass burning emissions using closed-path FTIR spectroscopy",
     long_description=long_description,
