@@ -1,232 +1,130 @@
 """
-Example Usage Script
+Complete analysis pipeline for one burn: spectra -> concentrations -> emission factors.
 
-This script demonstrates a complete workflow for analyzing FTIR fire emission data.
+Adjust the paths and the FUEL / XSEC_PATHS constants at the top. Cross-section data are
+not bundled with the package; see DATA_SOURCES.md for where to obtain them.
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 
-from ftir_fire_emissions import (
-    read_data,
-    get_compounds,
-    generate_reference,
-    process_spectra,
-    lasso_inversion,
+import numpy as np
+
+from pyrospectra import (
+    align_datetime, emission_factors, generate_reference, get_compounds, l_curve,
+    lasso_inversion, process_spectra, read_data, save_results, summarise,
     temporally_regularised_inversion,
-    inversion_residual,
-    save_results
 )
+
+# ---------------------------------------------------------------------------
+DATA_DIR = Path("./data/burns/peat_01")
+RESULT_DIR = Path("./results/peat_01")
+FUEL = "boreal_peat"                 # key into registry.CARBON_FRACTIONS (Table 1)
+N_PREIGNITION = 20                   # stabilised scans before ignition
+SIGMA_INSTRUMENT = 0.5               # cm^-1, Gaussian standard deviation
+PENALTY = "paper"                    # 'paper' = Eq. 3; 'legacy' = v1.0
+
+# Every species whose databank is 'xsec' needs a file here, or generation raises.
+XSEC_PATHS = {
+    # 'C3H6O':   'data/xsec/acetone.xsc',
+    # 'C5H8':    'data/xsec/isoprene.xsc',
+    # 'C4H4O':   'data/xsec/furan.xsc',
+    # 'C2H6O':   'data/xsec/ethanol.txt',
+    # 'CH3COOH': 'data/xsec/acetic_acid.txt',
+    # 'HNO2':    'data/xsec/nitrous_acid.txt',
+    # 'CH3CHO':  'data/xsec/acetaldehyde.txt',
+}
+# ---------------------------------------------------------------------------
 
 
 def main():
-    """
-    Complete analysis pipeline for FTIR fire emission data.
-    """
-    
-    # =========================================================================
-    # 1. SETUP
-    # =========================================================================
-    
-    # Define paths
-    data_dir = Path('./data/experiment_2024_01_15')  # Adjust to your data
-    compound_file = Path('./compounds.pkl')          # Compound definitions
-    result_dir = Path('./results/experiment_2024_01_15')
-    result_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Set regularization parameter (optimize using L-curve method)
-    lambda_reg = 1e-3
-    
-    # Set instrumental broadening (Gaussian width in cm^-1)
-    sigma_instrumental = 0.5
-    
-    
-    # =========================================================================
-    # 2. LOAD DATA
-    # =========================================================================
-    
-    print("=" * 70)
-    print("LOADING DATA")
-    print("=" * 70)
-    
-    # Load spectral data and metadata
-    spectra, wavenumbers, pressure, temperature, datetime = read_data(data_dir)
-    
-    print(f"\nData Summary:")
-    print(f"  Number of spectra: {len(spectra)}")
-    print(f"  Wavenumber range: {wavenumbers.min():.1f} - {wavenumbers.max():.1f} cm⁻¹")
-    print(f"  Gas cell pressure: {pressure:.5f} bar")
-    print(f"  Gas cell temperature: {temperature:.1f} K")
-    
-    # Load compound definitions
-    emission_species = get_compounds(compound_file)
-    print(f"  Number of candidate species: {len(emission_species)}")
-    
-    
-    # =========================================================================
-    # 3. GENERATE REFERENCE SPECTRA
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("GENERATING REFERENCE SPECTRA")
-    print("=" * 70)
-    
-    reference_spectra, full_reference, mask = generate_reference(
-        result_dir=result_dir,
-        emission_species=emission_species,
-        w=wavenumbers,
-        P=pressure,
-        T=temperature,
-        sigma=sigma_instrumental
-    )
-    
-    print(f"\nReference spectra shape: {reference_spectra.shape}")
-    print(f"Active spectral windows: {mask.sum()} / {len(mask)} wavenumbers")
-    
-    
-    # =========================================================================
-    # 4. PROCESS OBSERVED SPECTRA
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("PROCESSING OBSERVED SPECTRA")
-    print("=" * 70)
-    
-    observed_spectra, full_observed = process_spectra(
-        spectra, mask, result_dir
-    )
-    
-    print(f"\nProcessed spectra shape: {observed_spectra.shape}")
-    
-    
-    # =========================================================================
-    # 5. SPECIES IDENTIFICATION (LASSO)
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("IDENTIFYING PRESENT SPECIES")
-    print("=" * 70)
-    
-    (ref_filtered, full_ref_filtered, obs_filtered, 
-     species_filtered, lasso_scores) = lasso_inversion(
-        reference_spectra,
-        full_reference,
-        observed_spectra,
-        emission_species
-    )
-    
-    print(f"\nIdentified species: {list(species_filtered.keys())}")
-    print(f"Filtered reference shape: {ref_filtered.shape}")
-    print(f"Filtered observations shape: {obs_filtered.shape}")
-    
-    
-    # =========================================================================
-    # 6. REGULARIZED INVERSION
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("PERFORMING REGULARIZED INVERSION")
-    print("=" * 70)
-    print(f"Regularization parameter λ = {lambda_reg}")
-    
-    concentrations, uncertainties = temporally_regularised_inversion(
-        reference_spectra=ref_filtered,
-        residual_spectra=obs_filtered,
-        lambda_=lambda_reg,
-        result_dir=result_dir,
-        compound_list=list(species_filtered.keys())
-    )
-    
-    print(f"\nConcentration shape: {concentrations.shape}")
-    print(f"Uncertainty shape: {uncertainties.shape}")
-    
-    
-    # =========================================================================
-    # 7. COMPUTE RESIDUALS
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("COMPUTING MODEL RESIDUALS")
-    print("=" * 70)
-    
-    y_model, y_obs, y_model_err, y_model_wv, y_model_time = inversion_residual(
-        ref_filtered, obs_filtered, concentrations, uncertainties
-    )
-    
-    # Calculate fit statistics
-    residuals = y_obs - y_model
-    rmse = np.sqrt(np.mean(residuals**2))
-    r2 = 1 - np.sum(residuals**2) / np.sum((y_obs - np.mean(y_obs))**2)
-    
-    print(f"\nFit Statistics:")
-    print(f"  RMSE: {rmse:.6f}")
-    print(f"  R²: {r2:.4f}")
-    
-    
-    # =========================================================================
-    # 8. SAVE RESULTS
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("SAVING RESULTS")
-    print("=" * 70)
-    
-    save_results(
-        concentrations,
-        uncertainties,
-        list(species_filtered.keys()),
-        datetime[:len(obs_filtered)],  # Adjust for removed timesteps
-        result_dir,
-        prefix=''
-    )
-    
-    
-    # =========================================================================
-    # 9. PLOT RESULTS
-    # =========================================================================
-    
-    print("\n" + "=" * 70)
-    print("GENERATING PLOTS")
-    print("=" * 70)
-    
-    # Reshape concentrations for plotting
-    Ns = len(species_filtered)
-    Nt = len(obs_filtered)
-    conc_reshaped = concentrations.reshape(Ns, Nt, order='F')
-    uncert_reshaped = uncertainties.reshape(Ns, Nt, order='F')
-    
-    # Plot time series for each species
-    fig, axes = plt.subplots(Ns, 1, figsize=(12, 2*Ns), sharex=True)
-    if Ns == 1:
-        axes = [axes]
-    
-    for i, (species, ax) in enumerate(zip(species_filtered.keys(), axes)):
-        # Plot concentration with uncertainty band
-        time_indices = np.arange(Nt)
-        ax.plot(time_indices, conc_reshaped[i], label=species, color='C0')
-        ax.fill_between(
-            time_indices,
-            conc_reshaped[i] - uncert_reshaped[i],
-            conc_reshaped[i] + uncert_reshaped[i],
-            alpha=0.3, color='C0'
-        )
-        
-        ax.set_ylabel(f'{species}\nConcentration (ppm)')
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-    
-    axes[-1].set_xlabel('Time Step')
-    plt.tight_layout()
-    plt.savefig(result_dir / 'concentration_timeseries.pdf')
-    plt.savefig(result_dir / 'concentration_timeseries.png', dpi=300)
-    plt.close()
-    
-    print(f"\nPlots saved to {result_dir}")
-    
-    print("\n" + "=" * 70)
-    print("ANALYSIS COMPLETE")
-    print("=" * 70)
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 72, "\n1. LOADING DATA\n", "=" * 72, sep="")
+    spectra, wavenumbers, pressure, temperature, datetime = read_data(DATA_DIR)
+
+    print("=" * 72, "\n2. REFERENCE SPECTRA\n", "=" * 72, sep="")
+    # Restrict to the species you actually have data for. Dropping the xsec species
+    # entirely is fine - but then say so in the paper, rather than letting them vanish.
+    compounds = get_compounds()
+    missing = [s for s, v in compounds.items()
+               if v["databank"] == "xsec" and s not in XSEC_PATHS]
+    if missing:
+        print(f"  no cross-section file for {missing} - excluding them from this run")
+        compounds = {k: v for k, v in compounds.items() if k not in missing}
+
+    reference, full_reference, mask, provenance = generate_reference(
+        result_dir=RESULT_DIR, emission_species=compounds, w=wavenumbers,
+        P=pressure, T=temperature, sigma=SIGMA_INSTRUMENT, xsec_paths=XSEC_PATHS)
+
+    print("=" * 72, "\n3. OBSERVED SPECTRA\n", "=" * 72, sep="")
+    observed, _ = process_spectra(spectra, mask, RESULT_DIR,
+                                  n_preignition=N_PREIGNITION)
+
+    print("=" * 72, "\n4. SPECIES IDENTIFICATION\n", "=" * 72, sep="")
+    reference, full_reference, observed, species, lasso_score = lasso_inversion(
+        reference, full_reference, observed, compounds, seed=42)
+
+    print("=" * 72, "\n5. REGULARISATION PARAMETER\n", "=" * 72, sep="")
+    curve = l_curve(reference, observed, np.logspace(-8, -1, 40), penalty=PENALTY)
+    gamma = curve["gamma_optimal"]
+    print(f"  L-curve corner at gamma = {gamma:.3e} (penalty={PENALTY!r})")
+    print("  NOTE: re-run this per fuel type. The corner for smouldering peat sits at "
+          "a\n  higher gamma than for flaming agricultural residues, and the corner "
+          "for\n  penalty='paper' is not the corner for penalty='legacy'.")
+
+    print("=" * 72, "\n6. RETRIEVAL\n", "=" * 72, sep="")
+    result = temporally_regularised_inversion(
+        reference, observed, gamma, RESULT_DIR, list(species), penalty=PENALTY)
+
+    spread = result.effective_smoothing
+    worst = max(spread, key=spread.get)
+    print(f"  most heavily constrained species: {worst} "
+          f"(gamma*<mu>/G_ii = {spread[worst]:.2g})")
+
+    print("=" * 72, "\n7. EMISSION FACTORS\n", "=" * 72, sep="")
+    ef = emission_factors(result.concentrations, result.species, fuel=FUEL,
+                          n_background=N_PREIGNITION, uncertainty=result.uncertainty)
+    print(summarise(ef))
+
+    print("\n" + "=" * 72, "\n8. SAVING\n", "=" * 72, sep="")
+    save_results(result, datetime=align_datetime(datetime, lasso_score),
+                 result_dir=RESULT_DIR, emission_result=ef)
+
+    _plot(result, ef, RESULT_DIR)
+    print("Done.")
+
+
+def _plot(result, ef, result_dir):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    species = result.species
+    fig, axes = plt.subplots(len(species), 1, figsize=(11, 1.8 * len(species)),
+                             sharex=True)
+    axes = np.atleast_1d(axes)
+    t = np.arange(result.concentrations.shape[1])
+    for ax, name, conc, unc in zip(axes, species, result.concentrations,
+                                   result.uncertainty):
+        ax.plot(t, conc, lw=0.9)
+        ax.fill_between(t, conc - unc, conc + unc, alpha=0.3)
+        ax.set_ylabel(f"{name}\nppm", fontsize=8)
+        ax.grid(alpha=0.3)
+    axes[-1].set_xlabel("Time step")
+    fig.tight_layout()
+    fig.savefig(Path(result_dir) / "concentration_timeseries.png", dpi=200)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 3))
+    ax.plot(ef["MCE"], lw=0.9)
+    ax.axhline(0.9, ls="--", c="k", lw=0.8)
+    ax.set_ylabel("MCE")
+    ax.set_xlabel("Time step")
+    ax.set_title(f"MCE = {ef['MCE_mean']:.3f} +/- {ef['MCE_sd']:.3f}")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(Path(result_dir) / "mce.png", dpi=200)
+    plt.close(fig)
 
 
 if __name__ == "__main__":

@@ -1,46 +1,35 @@
-"""
-Setup script for FTIR Fire Emissions Analysis package
-"""
-
-from setuptools import setup, find_packages
+"""Setup script for PyroSpectra."""
 from pathlib import Path
+from setuptools import setup, find_packages
 
-# Read long description from README
-this_directory = Path(__file__).parent
-long_description = (this_directory / "README.md").read_text()
-
-# Read requirements
-requirements = (this_directory / "requirements.txt").read_text().strip().split('\n')
+here = Path(__file__).parent
+long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="pyrospectra",
-    version="1.0.0",
-    author="Luke Richardson-Foulger, José Gómez-Dans",
-    author_email="",  # Add email if desired
-    description="Analysis toolkit for biomass burning emissions using closed-path FTIR spectroscopy",
+    version="2.0.0",
+    author="Luke Richardson-Foulger, Martin Wooster, Jose Gomez-Dans, Mark Grosvenor",
+    description=("Biomass burning emission factors from closed-path FTIR "
+                 "time series spectra"),
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="",  # Add repository URL if available
+    url="https://github.com/NAEO-KCL/PyroSpectra",
     packages=find_packages(),
+    package_dir={"pyrospectra": "."},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Atmospheric Science",
         "Topic :: Scientific/Engineering :: Chemistry",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "License :: OSI Approved :: MIT License",  # Adjust as needed
+        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.8",
-    install_requires=requirements,
+    install_requires=[
+        "numpy>=1.20.0", "scipy>=1.7.0", "matplotlib>=3.4.0",
+        "scikit-learn>=0.24.0", "pandas>=1.3.0", "joblib>=1.0.0", "tqdm>=4.62.0",
+    ],
+    extras_require={"lbl": ["radis>=0.12.0"], "test": ["pytest>=7.0"]},
     keywords="FTIR spectroscopy fire emissions biomass burning atmospheric chemistry",
-    project_urls={
-        "Documentation": "",  # Add if available
-        "Source": "",  # Add repository URL
-        "Bug Reports": "",  # Add issue tracker URL
-    },
 )

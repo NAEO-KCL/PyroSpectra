@@ -1,260 +1,379 @@
 """
-Inversion Module
+Temporally regularised concentration retrieval.
 
-Temporally regularized concentration retrieval using Tikhonov regularization
-and uncertainty quantification.
+Solves, for the whole time series at once,
+
+    c_hat = argmin_c  || A c - y ||^2  +  gamma || D c ||^2                      (Eq. 3)
+
+and reports the posterior 1-sigma uncertainty
+
+    sigma_i = sigma_eps * sqrt( [ (A^T A + gamma D^T D)^-1 ]_ii )                (Eq. 2)
+
+with sigma_eps taken from the RMS of the retrieval fit residuals, as Section 2.3.1
+specifies. Setting ``gamma = 0`` reduces the estimator exactly to Classical Least
+Squares, which is the benchmark of Section 3.2.
+
 """
 
+import os
+import warnings
+
 import numpy as np
-import scipy.sparse as sp
-import scipy.sparse.linalg as spl
-import matplotlib.pyplot as plt
 
-from .preprocessing import build_A_matrix, create_smoother
+from .preprocessing import penalty_eigenvalues
 
 
-def temporally_regularised_inversion(reference_spectra, residual_spectra, 
-                                    lambda_, result_dir, compound_list,
-                                    post_cov=True, do_spilu=True):
+class RetrievalResult:
     """
-    Perform temporally regularized inversion using Tikhonov regularization.
-    
-    This function solves the regularized least squares problem:
-        minimize ||A*x - y||² + λ||D*x||²
-    
-    where:
-    - A encodes the reference spectra at each timestep
-    - x are the concentrations we want to retrieve
-    - y are the observed absorbance spectra
-    - D is the temporal smoothness operator
-    - λ controls the regularization strength
-    
-    Temporal regularization reduces noise-driven fluctuations while maintaining
-    good temporal resolution, as demonstrated in Figure 8 of the paper.
-    
+    Container for a retrieval.
+
+    Attributes
+    ----------
+    concentrations : np.ndarray, shape (Ns, Nt)   ppm
+    uncertainty : np.ndarray, shape (Ns, Nt)      ppm, 1-sigma, noise-scaled
+    species : list of str
+    sigma_eps : float                             absorbance noise level
+    residuals : np.ndarray, shape (Nt, Nl)        observed - modelled absorbance
+    correlation : np.ndarray, shape (Ns, Ns)      per-timestep posterior correlation
+    effective_dof : float
+    effective_smoothing : dict {species: float}
+        ``gamma * <mu> / G_ii`` per species - how hard the temporal penalty pulls
+        relative to that species' own information content. A single scalar gamma does
+        not smooth all species equally: G_ii scales with the square of the reference
+        amplitude, which spans orders of magnitude between a strong absorber like CO2
+        and a weak trace VOC, so the same gamma is a far heavier constraint on the
+        former. Values >> 1 mean that species is prior-dominated.
+    gamma, penalty : retrieval settings
+
+    Unpacks as ``concentrations, uncertainty`` for convenience.
+    """
+
+    __slots__ = ("concentrations", "uncertainty", "species", "sigma_eps",
+                 "residuals", "correlation", "effective_dof", "gamma", "penalty",
+                 "condition_number", "sigma_eps_source", "effective_smoothing")
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+    def __iter__(self):
+        yield self.concentrations
+        yield self.uncertainty
+
+    def __repr__(self):
+        ns, nt = self.concentrations.shape
+        return (f"<RetrievalResult {ns} species x {nt} timesteps, "
+                f"penalty={self.penalty!r}, gamma={self.gamma:g}, "
+                f"sigma_eps={self.sigma_eps:.3e}>")
+
+    def as_dict(self):
+        """``{species: (concentration, uncertainty)}`` in ppm."""
+        return {s: (self.concentrations[i], self.uncertainty[i])
+                for i, s in enumerate(self.species)}
+
+    def to_frame(self, datetime=None):
+        """Tidy pandas DataFrame of concentrations and their 1-sigma uncertainties."""
+        import pandas as pd
+        df = pd.DataFrame(self.concentrations.T, columns=list(self.species))
+        for i, s in enumerate(self.species):
+            df[f"{s}_sigma"] = self.uncertainty[i]
+        if datetime is not None:
+            df.insert(0, "datetime", np.asarray(datetime)[:df.shape[0]])
+        return df
+
+
+def _decoupled_solve(R, obs, gamma, penalty):
+    """
+    Exact solve and exact posterior diagonal via the eigenbasis of D.
+
+    Returns concentrations (Ns, Nt), unscaled variance (Ns, Nt), effective dof,
+    and the per-timestep Gram matrix G.
+    """
+    Ns, Nl = R.shape
+    Nt = obs.shape[0]
+
+    G = R @ R.T                                  # (Ns, Ns) = A^T A block
+    mu, U = penalty_eigenvalues(Nt, form=penalty)
+    b = R @ obs.T                                # (Ns, Nt) = A^T y, species-major
+    B = b @ U                                    # into the eigenbasis
+
+    Z = np.empty((Ns, Nt))
+    inv_diag = np.empty((Ns, Nt))
+    dof = 0.0
+    eye = np.eye(Ns)
+
+    for k in range(Nt):
+        Mk = G + gamma * mu[k] * eye
+        try:
+            Mk_inv = np.linalg.inv(Mk)
+        except np.linalg.LinAlgError as exc:
+            raise np.linalg.LinAlgError(
+                f"singular normal equations at eigenmode {k} (gamma={gamma:g}). "
+                "Two reference rows are probably collinear over the fitted channels; "
+                "check the correlation matrix and widen or separate those windows."
+            ) from exc
+        Z[:, k] = Mk_inv @ B[:, k]
+        inv_diag[:, k] = np.diag(Mk_inv)
+        dof += float(np.trace(Mk_inv @ G))
+
+    conc = Z @ U.T
+    variance = inv_diag @ (U.T ** 2)             # sum_k Minv_ii(k) * U[t,k]^2
+    return conc, variance, dof, G
+
+
+def temporally_regularised_inversion(reference_spectra, residual_spectra, lambda_,
+                                     result_dir=None, compound_list=None,
+                                     penalty="paper", noise_estimate="cls",
+                                     plot_correlation=True, **legacy):
+    """
+    Retrieve concentration time series.
+
     Parameters
     ----------
-    reference_spectra : np.ndarray
-        Reference absorbance spectra, shape (Ns, Nl)
-    residual_spectra : np.ndarray
-        Observed absorbance spectra, shape (Nt, Nl)
+    reference_spectra : np.ndarray, shape (Ns, Nl)
+        Absorbance of 1 ppm of each species over the cell path, in the same absorbance
+        convention as the observations (decadic by default).
+    residual_spectra : np.ndarray, shape (Nt, Nl)
+        Baseline-corrected observed absorbance.
     lambda_ : float
-        Regularization parameter. Controls smoothness vs. fit trade-off.
-        Typical values: 1e-4 to 1e-2. Use L-curve method to optimize.
-    result_dir : str or Path
-        Directory to save correlation matrix plot
-    compound_list : list
-        Names of compounds (for correlation matrix labels)
-    post_cov : bool, optional
-        Whether to compute and return posterior covariance. Default: True
-    do_spilu : bool, optional
-        Use incomplete LU factorization for faster solving. Default: True
-    
+        Regularisation strength gamma. Select with :func:`l_curve`; note that the
+        optimum differs between ``penalty='paper'`` and ``penalty='legacy'``.
+    penalty : {'paper', 'legacy'}
+        'paper' applies gamma * D^T D (Eq. 3). 'legacy' applies gamma * D (v1.0).
+    noise_estimate : {'cls', 'rms', 'reduced_chi2', float}
+        How sigma_eps is obtained.
+
+        'cls' (default) takes the RMS of the *unregularised* fit residuals. This still
+        follows Section 2.3.1 in absorbing reference-spectra and forward-model mismatch
+        rather than detector noise alone, and it reduces exactly to Eq. 2 when
+        gamma = 0, but it is not contaminated by the prior.
+
+        'rms' is the literal reading of Section 2.3.1: the RMS of the residuals of the
+        regularised fit itself. Be careful with it. Those residuals contain the
+        smoothing bias as well as the noise, and the bias grows with gamma - on a test
+        case with 3e-5 absorbance noise, this estimator returns 3.0e-5 at gamma = 0 but
+        2.4e-2 at gamma = 1e-3, a factor of 800. Because the reported uncertainty is
+        proportional to sigma_eps, using it makes the uncertainty *increase* with
+        regularisation strength, which inverts the effect reported in Section 3.2. The
+        measurement noise level is a property of the data, not of the prior.
+
+        'reduced_chi2' divides the regularised residuals by the residual degrees of
+        freedom, using the effective parameter count of the regularised estimator; this
+        partly but not wholly compensates the same effect. A float sets sigma_eps
+        directly, e.g. from a measured detector noise floor.
+
     Returns
     -------
-    x_sol : np.ndarray
-        Retrieved concentrations, shape (Ns*Nt,)
-        Reshape to (Nt, Ns) for time series of each species
-    sigma : np.ndarray
-        1-σ uncertainties for each concentration, same shape as x_sol
-        
-    Notes
-    -----
-    The posterior covariance matrix C is computed as:
-        C = (A^T A + λD^T D)^(-1)
-    
-    Diagonal elements give variances, off-diagonals show correlations
-    between species (indicating spectral overlap).
-    
-    References
-    ----------
-    Eilers (2003). A perfect smoother. Analytical Chemistry, 75(14), 3631-3636.
-    Calvetti et al. (2000). Tikhonov regularization and the L-curve.
+    RetrievalResult
+        Unpacks as ``(concentrations, uncertainty)``, both shaped (Ns, Nt), in ppm.
     """
-    print('Performing Tikhonov Regularisation')
-    
-    Ns, Nl = reference_spectra.shape
-    Nt = residual_spectra.shape[0]
-    
-    # Check dimensions
-    assert Nl == residual_spectra.shape[1], (
-        f"Spectral dimension mismatch: reference has {Nl} wavenumbers "
-        f"but observations have {residual_spectra.shape[1]}"
-    )
-    
-    # Flatten observed spectra into single vector
-    y = residual_spectra.flatten()
-    
-    # Build design matrix A: (Nl*Nt, Ns*Nt)
-    A_mat = build_A_matrix(reference_spectra, Ns, Nl, Nt)
-    
-    # Build temporal smoothness operator: (Ns*Nt, Ns*Nt)
-    # Kronecker product applies smoothing to each species independently
-    D_mat = sp.kron(sp.eye(Ns), create_smoother(Nt))
-    
-    # Compute regularized normal equations matrix
-    C = sp.csc_matrix(A_mat.T @ A_mat + lambda_ * D_mat)
-    
-    # Compute posterior covariance for uncertainty estimates
-    c_inv = np.linalg.inv(C.toarray())
-    sigma = np.sqrt(np.diag(c_inv))
-    
-    # Compute correlation matrix for single-timestep fit (diagnostic)
-    S = [sp.lil_matrix(reference_spectra[i, :].reshape(-1, 1)) for i in range(Ns)]
-    A_mat_single = sp.hstack(S)
-    C_single = sp.csc_matrix(A_mat_single.T @ A_mat_single)
-    c_inv_single = np.linalg.inv(C_single.toarray())
-    
-    # Convert covariance to correlation matrix
-    std_devs = np.sqrt(np.diag(c_inv_single))
-    inv_corr = c_inv_single / np.outer(std_devs, std_devs)
-    
-    # Plot correlation matrix
-    _plot_correlation_matrix(inv_corr, compound_list, result_dir)
-    
-    # Solve regularized system
-    if do_spilu:
-        # Incomplete LU factorization (faster, slight approximation)
-        x_sol = spl.spilu(C).solve(A_mat.T @ y)
+    if "do_spilu" in legacy:
+        warnings.warn(
+            "do_spilu is obsolete: the solver is now exact and direct, and no longer "
+            "uses an incomplete LU factorisation as though it were a direct solve.",
+            DeprecationWarning, stacklevel=2)
+    if "post_cov" in legacy:
+        warnings.warn("post_cov is obsolete; the posterior diagonal is always exact.",
+                      DeprecationWarning, stacklevel=2)
+
+    R = np.asarray(reference_spectra, dtype=float)
+    obs = np.asarray(residual_spectra, dtype=float)
+    if R.ndim != 2 or obs.ndim != 2:
+        raise ValueError("reference_spectra must be (Ns, Nl) and residual_spectra (Nt, Nl)")
+    Ns, Nl = R.shape
+    Nt = obs.shape[0]
+    if obs.shape[1] != Nl:
+        raise ValueError(
+            f"spectral dimension mismatch: reference has {Nl} channels, observations "
+            f"have {obs.shape[1]}. The reference mask and the observation mask must be "
+            "the same one returned by generate_reference().")
+
+    species = list(compound_list) if compound_list is not None else [f"S{i}" for i in range(Ns)]
+    if len(species) != Ns:
+        raise ValueError(f"compound_list has {len(species)} names for {Ns} reference rows")
+
+    gamma = float(lambda_)
+    print(f"Tikhonov retrieval: {Ns} species, {Nt} timesteps, {Nl} channels, "
+          f"penalty={penalty!r}, gamma={gamma:g}")
+
+    conc, variance, dof, G = _decoupled_solve(R, obs, gamma, penalty)
+
+    # --- residuals and the noise level -------------------------------------
+    model = conc.T @ R                              # (Nt, Nl)
+    residuals = obs - model
+    n_data = residuals.size
+
+    if isinstance(noise_estimate, (int, float)) and not isinstance(noise_estimate, bool):
+        sigma_eps = float(noise_estimate)
+        source = "supplied"
+    elif noise_estimate == "cls":
+        if gamma == 0.0:
+            sigma_eps = float(np.sqrt(np.mean(residuals ** 2)))
+        else:
+            conc0, _, _, _ = _decoupled_solve(R, obs, 0.0, penalty)
+            sigma_eps = float(np.sqrt(np.mean((obs - conc0.T @ R) ** 2)))
+        source = "RMS of unregularised (CLS) fit residuals"
+    elif noise_estimate == "rms":
+        sigma_eps = float(np.sqrt(np.mean(residuals ** 2)))
+        source = "RMS of regularised fit residuals (includes smoothing bias)"
+    elif noise_estimate == "reduced_chi2":
+        denom = max(n_data - dof, 1.0)
+        sigma_eps = float(np.sqrt(np.sum(residuals ** 2) / denom))
+        source = "reduced chi-squared of regularised fit"
     else:
-        # Direct sparse solver (slower, exact)
-        x_sol = spl.spsolve(C, A_mat.T @ y)
-    
-    print("Complete")
-    
-    return (x_sol, sigma)
+        raise ValueError(
+            f"Unknown noise_estimate {noise_estimate!r}; use 'cls', 'rms', "
+            "'reduced_chi2' or a float")
+
+    if sigma_eps <= 0:
+        warnings.warn("residual noise estimated as zero; uncertainties will be zero",
+                      RuntimeWarning)
+
+    uncertainty = sigma_eps * np.sqrt(np.clip(variance, 0.0, None))
+
+    # --- diagnostics --------------------------------------------------------
+    cond = float(np.linalg.cond(G))
+    if cond > 1e10:
+        warnings.warn(
+            f"per-timestep Gram matrix is ill-conditioned (cond = {cond:.2e}). Some "
+            "reference rows are close to collinear over the fitted channels; the "
+            "posterior correlations below will show which, and the affected species' "
+            "uncertainties should not be read as independent.",
+            RuntimeWarning)
+
+    mu_mean = float(np.mean(penalty_eigenvalues(Nt, form=penalty)[0]))
+    g_diag = np.clip(np.diag(G), 1e-300, None)
+    effective_smoothing = {sp: float(gamma * mu_mean / g)
+                           for sp, g in zip(species, g_diag)}
+    if gamma > 0:
+        vals = np.array(list(effective_smoothing.values()))
+        if vals.max() / max(vals.min(), 1e-300) > 100:
+            hi = max(effective_smoothing, key=effective_smoothing.get)
+            lo = min(effective_smoothing, key=effective_smoothing.get)
+            warnings.warn(
+                f"the single gamma={gamma:g} constrains species very unevenly: "
+                f"{hi} is smoothed {vals.max() / vals.min():.0f}x harder than {lo} "
+                "relative to its own information content. Check that no strongly "
+                "absorbing species has been flattened - inspect result."
+                "effective_smoothing, and re-run the L-curve for this fuel type.",
+                RuntimeWarning)
+
+    G_inv = np.linalg.pinv(G)
+    sd = np.sqrt(np.clip(np.diag(G_inv), 1e-300, None))
+    correlation = G_inv / np.outer(sd, sd)
+
+    if plot_correlation and result_dir is not None:
+        _plot_correlation_matrix(correlation, species, result_dir)
+
+    print(f"  sigma_eps = {sigma_eps:.4e} absorbance ({source})")
+    print(f"  effective dof = {dof:.1f} of {Ns * Nt}  |  median 1-sigma = "
+          f"{np.median(uncertainty):.3g} ppm")
+
+    return RetrievalResult(
+        concentrations=conc, uncertainty=uncertainty, species=species,
+        sigma_eps=sigma_eps, residuals=residuals, correlation=correlation,
+        effective_dof=dof, gamma=gamma, penalty=penalty, condition_number=cond,
+        sigma_eps_source=source, effective_smoothing=effective_smoothing)
 
 
-def inversion_residual(ref_spec, obs_spec, x_sol, sigma):
+def classical_least_squares(reference_spectra, residual_spectra, compound_list=None,
+                            noise_estimate="rms"):
     """
-    Calculate model predictions and residuals from inversion results.
-    
-    This function reconstructs the modeled absorbance spectra from the
-    retrieved concentrations and compares them to observations.
-    
-    Parameters
-    ----------
-    ref_spec : np.ndarray
-        Reference spectra matrix, shape (Ns, Nl)
-    obs_spec : np.ndarray
-        Observed spectra matrix, shape (Nt, Nl)
-    x_sol : np.ndarray
-        Retrieved concentrations, shape (Ns*Nt,)
-    sigma : np.ndarray
-        Concentration uncertainties, shape (Ns*Nt,)
-    
+    Per-spectrum Classical Least Squares - the estimator at the core of MALT and
+    OPUS GA, and the benchmark of Section 3.2. Identical to the regularised retrieval
+    with gamma = 0, which is how it is implemented, so that a comparison isolates the
+    temporal constraint and nothing else.
+    """
+    return temporally_regularised_inversion(
+        reference_spectra, residual_spectra, 0.0, result_dir=None,
+        compound_list=compound_list, noise_estimate=noise_estimate,
+        plot_correlation=False)
+
+
+def l_curve(reference_spectra, residual_spectra, gammas=None, penalty="paper"):
+    """
+    L-curve for the regularisation parameter (Calvetti et al. 2000).
+
     Returns
     -------
-    y_model : np.ndarray
-        Modeled absorbance (flattened), shape (Nt*Nl,)
-    y : np.ndarray
-        Observed absorbance (flattened), shape (Nt*Nl,)
-    y_model_err : np.ndarray
-        Model uncertainties (flattened), shape (Nt*Nl,)
-    y_model_wv_reshaped : np.ndarray
-        Modeled absorbance by wavenumber, shape (Nt, Nl)
-    y_model_time_reshaped : np.ndarray
-        First wavenumber of each timestep, shape (Nt,)
+    dict with 'gamma', 'residual_norm', 'solution_norm', 'penalty_norm', 'corner_index',
+    'gamma_optimal'.
+
+    The corner is located by maximum distance from the chord joining the endpoints of
+    the log-log curve. Re-run this whenever ``penalty`` changes: the corner for
+    ``'paper'`` sits at a different gamma from the corner for ``'legacy'``, so the
+    values quoted in the manuscript are not transferable between the two forms.
     """
-    print('Calculating Residuals')
-    
-    x_err = np.sqrt(sigma)
-    
-    Nl = ref_spec.shape[1]   # Number of wavenumbers
-    Nt = obs_spec.shape[0]   # Number of time steps
-    Ns = ref_spec.shape[0]   # Number of species
-    
-    # Flatten observations
-    y = obs_spec.flatten()
-    
-    # Reshape for broadcasting
-    # Reference: (Ns, 1, Nl)
-    ref_spec_reshaped = ref_spec.reshape(Ns, 1, Nl)
-    
-    # Concentrations: (Ns, Nt, 1)
-    # x_sol is stored as [species0_time0, species0_time1, ..., species1_time0, ...]
-    x_sol_reshaped = x_sol.reshape(Ns, Nt, order='F').reshape(Ns, Nt, 1)
-    x_err_reshaped = x_err.reshape(Ns, Nt, order='F').reshape(Ns, Nt, 1)
-    
-    # Calculate modeled absorbance: sum over species
-    # y_model[t,l] = sum_i ( c_i[t] * R_i[l] )
-    y_model = np.sum(ref_spec_reshaped * x_sol_reshaped, axis=0).flatten()
-    
-    # Propagate uncertainties
-    y_model_err = np.sqrt(
-        np.sum((ref_spec_reshaped * x_err_reshaped)**2, axis=0)
-    ).flatten()
-    
-    # Reshape for analysis
-    y_model_wv_reshaped, y_model_time_reshaped = reshape_residuals(
-        y_model, y, Nl
-    )
-    
-    return y_model, y, y_model_err, y_model_wv_reshaped, y_model_time_reshaped
+    R = np.asarray(reference_spectra, dtype=float)
+    obs = np.asarray(residual_spectra, dtype=float)
+    gammas = np.logspace(-8, 0, 40) if gammas is None else np.asarray(gammas, float)
+    Nt = obs.shape[0]
+
+    from .preprocessing import create_smoother
+    D = create_smoother(Nt)
+
+    res_norm, sol_norm, pen_norm = [], [], []
+    for g in gammas:
+        conc, _, _, _ = _decoupled_solve(R, obs, float(g), penalty)
+        res_norm.append(float(np.linalg.norm(obs - conc.T @ R)))
+        sol_norm.append(float(np.linalg.norm(conc)))
+        pen_norm.append(float(np.linalg.norm(conc @ D.T)))
+
+    x = np.log10(np.asarray(res_norm))
+    y = np.log10(np.asarray(sol_norm))
+    xs = (x - x.min()) / max(np.ptp(x), 1e-300)
+    ys = (y - y.min()) / max(np.ptp(y), 1e-300)
+    p1, p2 = np.array([xs[0], ys[0]]), np.array([xs[-1], ys[-1]])
+    seg = p2 - p1
+    def _cross2(a, b):
+        return a[0] * b[1] - a[1] * b[0]
+    dist = [abs(_cross2(seg, p1 - np.array([xi, yi]))) / np.linalg.norm(seg)
+            for xi, yi in zip(xs, ys)]
+    corner = int(np.argmax(dist))
+
+    return {"gamma": gammas, "residual_norm": np.asarray(res_norm),
+            "solution_norm": np.asarray(sol_norm), "penalty_norm": np.asarray(pen_norm),
+            "corner_index": corner, "gamma_optimal": float(gammas[corner]),
+            "penalty": penalty}
 
 
-def reshape_residuals(y_model, y, Nl):
+def inversion_residual(ref_spec, obs_spec, result):
     """
-    Reshape residual data for visualization.
-    
-    Parameters
-    ----------
-    y_model : np.ndarray
-        Modeled data (flattened)
-    y : np.ndarray
-        Observed data (flattened)
-    Nl : int
-        Number of wavenumbers
-    
-    Returns
-    -------
-    y_model_wv_squeezed : np.ndarray
-        Modeled data reshaped by wavenumber, shape (Nt, Nl)
-    y_model_time_squeezed : np.ndarray
-        First element of each timestep, shape (Nt,)
+    Modelled absorbance and residuals from a :class:`RetrievalResult`.
+
+    v1.0's version took ``np.sqrt(sigma)`` of a quantity that was already 1-sigma, and
+    reshaped the concentrations with ``order='F'``. Both are corrected here.
     """
-    # Reshape to (Nt, Nl)
-    y_model_wv_squeezed = y_model.reshape(-1, Nl)
-    
-    # Extract first wavenumber of each timestep
-    y_model_time_squeezed = y_model_wv_squeezed[:, 0]
-    
-    return y_model_wv_squeezed, y_model_time_squeezed
+    R = np.asarray(ref_spec, dtype=float)
+    obs = np.asarray(obs_spec, dtype=float)
+    conc = result.concentrations if isinstance(result, RetrievalResult) else np.asarray(result)
+    err = result.uncertainty if isinstance(result, RetrievalResult) else None
+
+    y_model = conc.T @ R
+    y_err = (np.sqrt((err.T ** 2) @ (R ** 2)) if err is not None else None)
+    return y_model, obs, y_err, obs - y_model
 
 
-def _plot_correlation_matrix(corr_matrix, compound_list, result_dir):
-    """
-    Plot correlation matrix between species.
-    
-    Parameters
-    ----------
-    corr_matrix : np.ndarray
-        Correlation matrix, shape (Ns, Ns)
-    compound_list : list
-        Species names for labels
-    result_dir : str
-        Directory to save plot
-    """
-    import os
-    os.makedirs(f'{result_dir}/reference_information', exist_ok=True)
-    
-    plt.figure(figsize=(10, 8))
-    plt.imshow(corr_matrix, cmap='seismic', vmin=-1, vmax=1, aspect='auto')
-    
-    # Set tick positions and labels
-    ticks = np.arange(len(compound_list))
-    plt.xticks(ticks, compound_list, rotation=45, ha='right')
-    plt.yticks(ticks, compound_list)
-    
-    # Add colorbar
-    cbar = plt.colorbar(pad=0.01)
-    cbar.set_label('Correlation Coefficient', rotation=-90, labelpad=15)
-    
-    plt.title('Species Correlation Matrix')
+def _plot_correlation_matrix(corr, species, result_dir):
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+    os.makedirs(f"{result_dir}/reference_information", exist_ok=True)
+    plt.figure(figsize=(1 + 0.55 * len(species), 0.9 + 0.5 * len(species)))
+    plt.imshow(corr, cmap="seismic", vmin=-1, vmax=1)
+    ticks = np.arange(len(species))
+    plt.xticks(ticks, species, rotation=45, ha="right")
+    plt.yticks(ticks, species)
+    for i in range(len(species)):
+        for j in range(len(species)):
+            plt.text(j, i, f"{corr[i, j]:.2f}", ha="center", va="center", fontsize=6)
+    cb = plt.colorbar(pad=0.02)
+    cb.set_label("Correlation coefficient", rotation=-90, labelpad=14)
+    plt.title("Posterior correlation between retrieved species")
     plt.tight_layout()
-    
-    plt.savefig(f'{result_dir}/reference_information/Correlation_Matrix.png', dpi=300)
-    plt.savefig(f'{result_dir}/reference_information/Correlation_Matrix.pdf')
+    plt.savefig(f"{result_dir}/reference_information/Correlation_Matrix.png", dpi=250)
     plt.close()
-    
-    print(f"Correlation matrix saved to {result_dir}/reference_information/")
+
+
+__all__ = ["temporally_regularised_inversion", "classical_least_squares", "l_curve",
+           "inversion_residual", "RetrievalResult"]

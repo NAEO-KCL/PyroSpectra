@@ -1,314 +1,215 @@
-![439965275-fa9d8640-c4ef-44e6-84ef-7c18750c825e](https://github.com/user-attachments/assets/8f95a25d-2626-409e-bbff-8081ebb8af92)
+# PyroSpectra
 
-# PyroSpectra: Biomass Burning Emission Factors From FTIR Time Series Spectra
-
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18552195.svg)](https://doi.org/10.5281/zenodo.18552195)
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Python package for analysing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy.
+Biomass burning emission factors from closed-path FTIR time series spectra.
 
-## Overview
+Implements the methodology of Richardson-Foulger, Wooster, Gómez-Dans & Grosvenor (2026), *JGR: Biogeosciences* — from raw MATRIX-MG5 spectra through to emission factors by carbon mass balance.
 
-<!--- This package implements the methodology described in **Richardson-Foulger et al. (2026)** for retrieving fire emission factors from laboratory FTIR measurements. Key features include: --->
+**Version 2.0 adds an optically-thick, high-concentration retrieval (`thick_smoke`) for
+close-to-source, undiluted smoke, a rigorous per-species detection framework, and a
+publication-quality diagnostic-plot suite. The v1.1 temporal-regularisation retrieval is
+unchanged and remains the default for diluted/stabilised time series. Read
+[CHANGELOG.md](CHANGELOG.md).** (v1.1 corrected four v1.0 defects and added the reference
+spectra v1.0 could not generate; emission ratios, factors and MCE were unchanged there.)
 
-- **Spectral preprocessing** with optimized asymmetric least squares (O-ALS) baseline correction
-- **Reference spectra generation** using RADIS to retrieve and simulate HITRAN/HITEMP molecular databases
-- **Automated species identification** via L1-regularized (Lasso) regression
-- **Temporally regularised retrievals** using Tikhonov regularization
-- **Uncertainty quantification** through posterior covariance matrices
-- **Emission factor calculations** using carbon mass balance method
+---
+
+## Two complementary retrievals
+
+| | `inversion` (v1.1, default) | `thick_smoke` (v2.0) |
+|---|---|---|
+| Best for | diluted / stabilised time series | close-to-source, **optically-thick** smoke |
+| Estimator | CLS + **temporal** Tikhonov regularisation | **non-negative** bounded per-time-step LS |
+| Interferents | windowed references | CO2/H2O/CO **full-spectrum** + per-window continuum term |
+| Saturation | window choice | window choice + **optical-depth channel weighting** |
+| Ratios | per-time-step | slope-based, with an optically-thin regime for N2O |
+| Detection | lasso screening | lasso + **3σ detection limit** + carbon-plausibility |
+
+---
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.8 or higher
-- pip package manager
-
-### Install from source
-
 ```bash
-git clone https://github.com/your-repo/ftir-fire-emissions.git
-cd ftir-fire-emissions
 pip install -e .
 ```
 
-### Dependencies
+Requires `numpy`, `scipy`, `scikit-learn`, `pandas`, `matplotlib`, `joblib`. `radis` is
+needed only for line-by-line reference generation and is imported lazily — the
+retrieval and emission factor code runs without it.
 
-The package automatically installs:
-```
-numpy>=1.20.0
-scipy>=1.7.0
-matplotlib>=3.4.0
-scikit-learn>=0.24.0
-radis>=0.12.0
-pandas>=1.3.0
-tqdm>=4.62.0
-joblib>=1.0.0
-```
+---
 
-## Quick Start
-
-### Complete Analysis Pipeline
+## Pipeline
 
 ```python
-from ftir_fire_emissions import (
-    read_data,
-    get_compounds,
-    generate_reference,
-    process_spectra,
-    lasso_inversion,
-    temporally_regularised_inversion,
-    save_results
-)
+from pyrospectra import (read_data, get_compounds, generate_reference, process_spectra,
+                         lasso_inversion, temporally_regularised_inversion, l_curve,
+                         emission_factors, summarise, save_results, align_datetime)
 
-# 1. Load spectral data from MATRIX-MG5 FTIR
-spectra, wavenumbers, pressure, temperature, datetime = read_data('path/to/data')
+# 1. Load a burn
+spectra, w, P, T, dt = read_data('burns/peat_01')
 
-# 2. Load compound definitions (species and spectral windows)
-emission_species = get_compounds('compounds.pkl')
+# 2. Species, windows and databanks come from the registry (Table D1), not a pickle
+compounds = get_compounds()
 
-# 3. Generate reference spectra using RADIS/HITRAN
-reference_spectra, full_reference, mask = generate_reference(
-    result_dir='./results',
-    emission_species=emission_species,
-    w=wavenumbers,
-    P=pressure,  # bar
-    T=temperature,  # K
-    sigma=0.5  # Instrumental broadening (cm⁻¹)
-)
+# 3. Reference matrix. Cross-section species need data files - see DATA_SOURCES.md
+ref, full, mask, prov = generate_reference(
+    'results/peat_01', compounds, w, P, T, sigma=0.5,
+    xsec_paths={'C3H6O': 'data/xsec/acetone.xsc',
+                'C5H8':  'data/xsec/isoprene.xsc'})
 
-# 4. Process observed spectra (baseline correction + absorbance conversion)
-observed_spectra, full_observed = process_spectra(spectra, mask, './results')
+# 4. Observed absorbance, baseline from the stabilised pre-ignition block
+obs, full_obs = process_spectra(spectra, mask, 'results/peat_01', n_preignition=20)
 
-# 5. Identify present species using Lasso regression
-(ref_filtered, full_ref_filtered, obs_filtered, 
- species_filtered, lasso_scores) = lasso_inversion(
-    reference_spectra,
-    full_reference,
-    observed_spectra,
-    emission_species
-)
+# 5. Which species are detectably present
+ref, full, obs, species, score = lasso_inversion(ref, full, obs, compounds, seed=42)
 
-# 6. Perform temporally regularized inversion
-concentrations, uncertainties = temporally_regularised_inversion(
-    reference_spectra=ref_filtered,
-    residual_spectra=obs_filtered,
-    lambda_=1e-3,  # Regularization parameter (optimize with L-curve)
-    result_dir='./results',
-    compound_list=list(species_filtered.keys())
-)
+# 6. Choose gamma from the L-curve - per fuel type, and per penalty form
+gamma = l_curve(ref, obs, penalty='paper')['gamma_optimal']
 
-# 7. Save results
-save_results(concentrations, uncertainties, 
-             list(species_filtered.keys()), datetime,
-             './results')
+# 7. Retrieve. Returns (Ns, Nt) arrays in ppm, already correctly shaped
+result = temporally_regularised_inversion(ref, obs, gamma, 'results/peat_01',
+                                          list(species), penalty='paper')
+
+# 8. Emission factors by carbon mass balance
+ef = emission_factors(result.concentrations, result.species, fuel='boreal_peat',
+                      n_background=20, uncertainty=result.uncertainty)
+print(summarise(ef))
+
+save_results(result, datetime=align_datetime(dt, score),
+             result_dir='results/peat_01', emission_result=ef)
 ```
 
-### Optimize Regularization Parameter
+Burn directories are large — ~375 MB of `.prn` text for 666 spectra. To move or archive
+them, `examples/pack_for_transfer.py` writes a compressed `.npz` about 15x smaller,
+keeping only the channels inside a Table D1 window; `read_data` accepts the archive
+directly.
 
-Use the L-curve method to find optimal λ:
+`examples/example_workflow.py` runs this end to end;
+`examples/l_curve_optimization.py` compares the two penalty forms.
+
+### Optically-thick retrieval (v2.0)
+
+For close-to-source, undiluted smoke where CO2/H2O saturate and strong absorbers bleed into
+the trace windows, use `thick_smoke`:
 
 ```python
-from ftir_fire_emissions.examples.l_curve_optimization import (
-    compute_l_curve, find_corner
-)
+import numpy as np
+from pyrospectra import thick_smoke as TS
+from pyrospectra import diagnostics
+from pyrospectra.io_utils import read_spectra, get_pt
 
-# Test range of λ values
-lambda_range = np.logspace(-6, -1, 50)
-residual_norms, solution_norms = compute_l_curve(
-    ref_filtered, obs_filtered, lambda_range
-)
+TS.configure(xsec_dir='data/xsec', refcache='results/_refcache')   # no hard-coded paths
+spec, w = read_spectra('burns/corn_01/Spectra')
+P, T, _ = get_pt('burns/corn_01')
 
-# Find optimal value
-corner_idx = find_corner(residual_norms, solution_norms)
-lambda_optimal = lambda_range[corner_idx]
-print(f"Optimal λ = {lambda_optimal:.2e}")
+rec = TS.retrieve(spec, w, P, T, fuel_cf=0.45, return_fit=True)     # one burn
+for s in rec['species']:
+    if TS.detected(rec, s):
+        print(s, rec['EF'][s], 'g/kg')                             # quantitative
+    elif TS.detection_limit_ok(rec, s):
+        print(s, '<', rec['EF_DL'][s], 'g/kg (3-sigma)')           # upper bound
+
+diagnostics.all_diagnostics(rec, 'results/corn_01')                 # spectral atlas, L-curve, ...
 ```
 
-## Data Format
+`examples/thick_smoke_workflow.py` runs this end to end for one burn.
 
-### Input Files
-
-The package expects data from the Bruker MATRIX-MG5 FTIR spectrometer:
-
-```
-experiment_directory/
-├── Spectra/
-│   ├── spectrum_0000.prn
-│   ├── spectrum_0001.prn
-│   └── ...
-└── PT_Log.txt  # Optional: pressure/temperature log
-```
-
-Each `.prn` file contains two columns:
-```
-wavenumber (cm⁻¹)    intensity
-800.0                0.9234
-800.5                0.9187
-...
-```
-
-### Compound Definitions
-
-Create a pickle file defining target species and spectral windows:
-
-```python
-import pickle
-
-compounds = {
-    'CO2': {'bounds': [[2200, 2400], [3500, 3800]]},
-    'CO': {'bounds': [[2000, 2250]]},
-    'CH4': {'bounds': [[1150, 1400], [2800, 3100]]},
-    'H2O': {'bounds': [[1300, 2000], [3400, 4000]]},
-    # Add more species...
-}
-
-with open('compounds.pkl', 'wb') as f:
-    pickle.dump(compounds, f)
-```
-
-## Package Structure
-
-```
-ftir_fire_emissions/
-├── __init__.py              # Package initialization
-├── preprocessing.py         # Baseline correction, absorbance conversion
-├── reference.py            # RADIS-based reference spectra generation  
-├── species_selection.py    # Lasso regression for species ID
-├── inversion.py            # Tikhonov regularization, uncertainty quantification
-├── io_utils.py             # File I/O for MATRIX-MG5 data
-├── examples/
-│   ├── example_workflow.py      # Complete analysis pipeline
-│   └── l_curve_optimization.py  # Regularization parameter selection
-├── tests/                  # Unit tests
-├── requirements.txt        # Python dependencies
-├── setup.py               # Installation script
-├── LICENSE                # MIT License
-├── CITATION.cff          # Software citation metadata
-└── README.md             # This file
-```
+---
 
 ## Methodology
 
-### 1. Baseline Correction (O-ALS)
+**Baseline** — optimised asymmetric least squares (Dong & Xu 2024) on the stabilised
+pre-ignition block, kept sparse so it scales to the ~29,900-channel MG5 grid.
 
-Optimized Asymmetric Least Squares removes instrumental drift:
-```
-minimize: ||W(y - baseline)||² + λ||D²·baseline||²
-```
-where asymmetric weights W penalize points above the baseline more heavily.
+**Reference spectra** — two pathways feeding one matrix. Line-by-line via RADIS from
+HITRAN, HITEMP or GEISA; measured cross-sections via `xsections` for the heavy VOCs
+that have no line list. Both are returned as decadic absorbance of 1 ppm over the 5 m
+path, which is what makes them mixable. Every source file's SHA-256 is recorded.
 
-### 2. Reference Spectra
+**Species identification** — L1-regularised regression with 5-fold cross-validation,
+non-negative, over 10–20 randomly sampled time-steps; a species zero at all of them is
+judged undetectable and dropped.
 
-Generated using RADIS line-by-line radiative transfer:
-- HITRAN 2020 molecular database
-- Voigt line profiles with Doppler + pressure broadening
-- Gaussian convolution for instrumental broadening
+**Retrieval** — Tikhonov regularisation on the temporal difference of the concentration
+series, `argmin ||Ac − y||² + gamma||Dc||²`. Solved exactly by eigen-decoupling into Nt
+independent Ns×Ns systems, so neither A nor a dense `(Ns·Nt)²` inverse is ever formed.
 
-### 3. Species Identification (Lasso)
+**Uncertainty** — `sigma_i = sigma_eps · sqrt([(AᵀA + gamma·DᵀD)⁻¹]_ii)`, in ppm, with
+`sigma_eps` from the unregularised fit residuals. Reduces exactly to Eq. 2 at gamma = 0.
 
-L1-regularized regression automatically selects present species:
-```
-minimize: ||Ax - y||² + α||x||₁
-```
-Non-zero coefficients indicate detected species.
+**Emission factors** — per-time-step emission ratios against a time-weighted
+pre-ignition background, then carbon mass balance (Eqs. 4–7).
 
-### 4. Regularized Inversion (Tikhonov)
+---
 
-Temporal smoothness constraint reduces noise:
-```
-minimize: ||Ax - y||² + λ||Dx||²
-```
-where D is first-order difference operator.
+## Things to know before trusting the output
 
-### 5. Uncertainty Quantification
+**γ does not carry across penalty forms.** `penalty='paper'` (Eq. 3, curvature²) and
+`penalty='legacy'` (v1.0, first-order) put the L-curve corner in different places. The
+values quoted in the manuscript were obtained under one convention; re-run `l_curve`.
 
-Posterior covariance matrix:
-```
-C = (AᵀA + λDᵀD)⁻¹
-```
-Diagonal: variances. Off-diagonal: correlations (spectral interference).
+**γ constrains species unequally.** A single scalar competes against `G_ii`, which
+scales with the square of the reference amplitude and spans orders of magnitude between
+CO₂ and a trace VOC. Check `result.effective_smoothing`; the retrieval warns when the
+spread exceeds 100×.
 
-## Examples
+**Cross-section species are extrapolated in temperature.** The cell runs at 448 K; the
+libraries are measured near ambient. Contour comes from the nearest measurement and
+band strength from the trend, but hot-band population is not corrected. Emission
+factors for HNO₂, CH₃COOH, C₂H₆O, C₃H₆O, C₄H₄O, C₅H₈ and CH₃CHO carry a systematic that
+the posterior covariance does not contain. See §4 of `DATA_SOURCES.md`.
 
-See `examples/` directory for:
-- `example_workflow.py`: Complete analysis pipeline
-- `l_curve_optimization.py`: Regularization parameter selection
+**The smoothness prior rings at sharp transitions.** Where concentrations genuinely
+change within the sampling interval — flaming ignition, not smouldering decay — the
+curvature penalty smears the step and overshoots around it. Pinned by
+`test_smoothness_prior_smears_a_step`.
 
-Run examples:
+**`emissions.py` is new in v1.1** and has not been cross-checked against the authors'
+own EF pipeline. Verify one burn against a known result first.
+
+**Two registry entries need your decision.** Table D1 attributes ethanol, acetone, furan
+and isoprene to GEISA, which has no line lists for them; and CH₃CHO is reported in
+Figures 8–9 but has no window in Table D1, so the registry carries a placeholder that
+overlaps SO₂ and HNO₂. Both are flagged in `registry.py`.
+
+---
+
+## Tests
+
 ```bash
-cd examples
-python example_workflow.py
+python -m pytest pyrospectra/tests -v
 ```
+
+36 tests, each against an analytically known answer, so a regression in the conventions clearly fails rather than producing plausible numbers.
+
+---
 
 ## Citation
 
-If you use this software, please cite:
-
 ```bibtex
-@article{richardson2026ftir,
-  title={Use of a Closed-Path 'Industrial Emissions' FTIR Spectrometer for 
-         Close-to-Source Laboratory Sampling of Biomass Burning Smoke and 
-         Retrieval of Fire Emission Factors},
-  author={Richardson-Foulger, Luke and Wooster, Martin and 
-          G{\'o}mez-Dans, Jos{\'e} and Grosvenor, Mark},
-  year={2026}}
+@article{richardsonfoulger2026ftir,
+  title  = {Laboratory use of a Closed-Path 'Industrial Emissions' {FTIR} Spectrometer for High-Concentration Sampling of Biomass Burning Smoke and Retrieval of
+            Fire Emission Factors},
+  author = {Richardson-Foulger, Luke and Wooster, Martin and
+            G{\'o}mez-Dans, Jos{\'e} and Grosvenor, Mark},
+  journal= {Journal of Geophysical Research: Biogeosciences},
+  year   = {2026}}
+
+ @misc{richardsonfoulger_gomezdans_2026, title={{PyroSpectra}: Biomass Burning Emission Factors From {FTIR} Time Series Spectra}, url={https://zenodo.org/records/18552195}, DOI={10.5281/zenodo.18552195}, abstractNote={A Python package for analysing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy, implementing temporally regularised concentration retrievals with automated species identification.}, publisher={Zenodo}, author={Richardson-Foulger, Luke and Gómez-Dans, José}, year={2026}}
+
 ```
 
-Also cite the RADIS package used for reference spectra:
-```bibtex
-@article{pannier2019radis,
-  title={RADIS: A nonequilibrium line-by-line radiative code for CO₂ and 
-         HITRAN-like database species},
-  author={Pannier, Erwan and Laux, Christophe O},
-  journal={Journal of Quantitative Spectroscopy and Radiative Transfer},
-  volume={222},
-  pages={12--25},
-  year={2019}
-}
-```
+Also cite RADIS (Pannier & Laux 2019) and whichever spectroscopic databases you used — see `DATA_SOURCES.md`.
 
-## Contributing
+## Licence
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/new-feature`)
-3. Commit changes (`git commit -am 'Add new feature'`)
-4. Push to branch (`git push origin feature/new-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details.
+MIT. Spectroscopic data are **not** redistributed with this package and carry their own terms.
 
 ## Authors
 
-**Luke Richardson-Foulger**
-**José Gómez-Dans**
-
-Leverhulme Centre for Wildfires, Environment and Society  
-Department of Geography, King's College London  
-London, UK
-
-## Acknowledgments
-
-- NERC National Centre for Earth Observation (NCEO)
-- Leverhulme Centre for Wildfires, Environment and Society
-- RADIS development team
-
-## Support
-
-For questions or issues:
-- Open an issue on GitHub
-- Contact: [luke.richardson-foulger@kcl.ac.uk]
-
-## References
-
-Key papers implementing similar methodology:
-
-- Dong & Xu (2024). Baseline estimation using O-ALS. *Measurement*, 233, 114731.
-- Pannier & Laux (2019). RADIS radiative transfer code. *JQSRT*, 222, 12-25.
-- Eilers (2003). A perfect smoother. *Analytical Chemistry*, 75(14), 3631-3636.
-- Calvetti et al. (2000). Tikhonov regularization and the L-curve. *J. Comp. Appl. Math.*
+Luke Richardson-Foulger, José Gómez-Dans
+Leverhulme Centre for Wildfires, Environment and Society / NERC National Centre for
+Earth Observation, King's College London

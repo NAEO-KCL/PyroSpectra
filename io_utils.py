@@ -1,262 +1,190 @@
 """
-I/O Utilities Module
-
-Functions for reading spectral data, metadata, and compound definitions.
+File I/O for MATRIX-MG5 data and retrieval results.
 """
 
 import os
+import pickle as pkl
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import pickle as pkl
-from tqdm import tqdm
+
+try:
+    from tqdm import tqdm
+except ImportError:                                  # tqdm is optional
+    def tqdm(it, **_kw):
+        return it
 
 
 def read_spectrum(fname):
-    """
-    Read a single spectrum file.
-    
-    Parameters
-    ----------
-    fname : str or Path
-        Path to spectrum file (.prn format)
-    
-    Returns
-    -------
-    np.ndarray
-        Spectrum intensity values
-    """
+    """Read one ``.prn`` spectrum (column 1 = intensity)."""
     return np.loadtxt(fname, usecols=[1])
 
 
 def read_spectra(spectral_data, cutoff=800):
     """
-    Read all spectral data files from a directory.
-    
-    The MATRIX-MG5 FTIR outputs .prn files containing wavenumber and
-    intensity columns. This function reads all such files and constructs
-    a time series of spectra.
-    
-    Parameters
-    ----------
-    spectral_data : str or Path
-        Directory containing .prn spectral files
-    cutoff : int, optional
-        Wavenumber cutoff (cm^-1). Removes low-wavenumber noise.
-        Default: 800 cm^-1
-    
-    Returns
-    -------
-    spectra : np.ndarray
-        Array of spectra, shape (Nt, Nl) where Nt is number of timesteps
-        and Nl is number of wavenumbers above cutoff
-    wvc : np.ndarray
-        Wavenumber array (cm^-1) after cutoff applied, shape (Nl,)
-        
-    Notes
-    -----
-    Files are sorted by name to ensure correct temporal ordering.
-    All files must have the same wavenumber grid.
+    Read a directory of ``.prn`` files into a (Nt, Nl) array, sorted by filename.
+
+    Filenames are sorted naturally, so ``spectrum_9`` precedes ``spectrum_10``. v1.0
+    used a plain lexical sort, which orders them the other way round whenever the index
+    is not zero-padded - and a shuffled time axis silently invalidates the temporal
+    smoothness constraint.
     """
-    if isinstance(spectral_data, str):
-        spectral_data = Path(spectral_data)
-    
-    # Get all .prn files, sorted by name
-    files = sorted([f for f in spectral_data.glob("*.prn")])
-    
+    spectral_data = Path(spectral_data)
+    files = sorted(spectral_data.glob("*.prn"), key=_natural_key)
     if not files:
         raise FileNotFoundError(f"No .prn files found in {spectral_data}")
-    
-    # Read wavenumbers from first file (all files have same grid)
+
     wv = np.loadtxt(files[0], usecols=[0])
-    
-    # Read all spectra
     spectra = np.array([read_spectrum(f) for f in tqdm(files, desc="Reading spectra")])
-    
-    # Apply cutoff to remove low-wavenumber noise
-    wvc = wv[wv > cutoff]
-    spectra = spectra[:, wv > cutoff]
-    
-    print(f"Loaded {len(spectra)} spectra with {len(wvc)} wavenumbers")
-    
-    return spectra, wvc
+
+    bad = [f.name for f, s in zip(files, spectra) if s.shape != wv.shape]
+    if bad:
+        raise ValueError(f"{len(bad)} spectra have a different wavenumber grid to "
+                         f"{files[0].name}, e.g. {bad[:3]}")
+
+    keep = wv > cutoff
+    print(f"Loaded {len(spectra)} spectra, {keep.sum()} channels above {cutoff} cm-1 "
+          f"({wv[keep].min():.1f}-{wv[keep].max():.1f}, "
+          f"step {np.median(np.diff(wv[keep])):.4f} cm-1)")
+    return spectra[:, keep], wv[keep]
+
+
+def _natural_key(path):
+    import re
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
 
 
 def get_pt(directory):
     """
-    Read pressure and temperature log from MATRIX-MG5.
-    
-    The MATRIX-MG5 logs gas cell pressure and temperature to a CSV file.
-    This function reads the log and returns median values.
-    
-    Parameters
-    ----------
-    directory : str or Path
-        Directory containing PT_Log.txt file
-    
+    Read the gas cell pressure/temperature log.
+
     Returns
     -------
-    P : float
-        Median pressure in bar
-    T : float
-        Median temperature in Kelvin
-    datetime : np.ndarray or None
-        Datetime array if log exists, None otherwise
-        
-    Notes
-    -----
-    If no PT log is found, defaults to standard conditions (300 K, 1.01325 bar).
+    P : float, bar   T : float, K   datetime : np.ndarray or None
     """
-    for filename in os.listdir(directory):
-        if filename.endswith('PT_Log.txt'):
-            # Read PT log
-            df = pd.read_csv(
-                os.path.join(directory, filename),
-                delimiter=',',
-                names=["Date", "Time", "T", "P"]
-            )
-            
-            # Extract median values
-            T = np.median(df["T"])      # Kelvin
-            P = np.median(df["P"]) / 1000  # mbar to bar
-            
-            # Parse datetime
-            datetime = pd.to_datetime(df["Date"] + " " + df["Time"]).to_numpy()
-            
-            print(f"Gas cell conditions: T = {T:.1f} K, P = {P:.5f} bar")
-            return P, T, datetime
-    
-    # Default to standard conditions if no log found
-    print("Warning: No PT log found. Using default conditions (300 K, 1.01325 bar)")
-    T = 300.0
-    P = 1.01325
-    datetime = None
-    
-    return P, T, datetime
+    for filename in sorted(os.listdir(directory)):
+        if filename.endswith("PT_Log.txt"):
+            # MATRIX-MG5 progression logs write: Date, Time, Pressure/mbar, Temperature/degC.
+            # (Column order and units confirmed against the raw logs: col 3 ~840 mbar,
+            # col 4 ~167 degC == ~440 K, consistent with the heated MG5 cell. v1.1 as
+            # shipped named these ["T","P"] in the opposite order and applied no degC->K
+            # conversion, which fed RADIS ~840 K / ~0.167 bar. Corrected here.)
+            df = pd.read_csv(os.path.join(directory, filename), delimiter=",",
+                             names=["Date", "Time", "P_mbar", "T_C"])
+            T = float(np.median(df["T_C"])) + 273.15          # deg C -> K
+            P = float(np.median(df["P_mbar"])) / 1000.0       # mbar -> bar
+            dt = pd.to_datetime(df["Date"] + " " + df["Time"]).to_numpy()
+            spread_T = float(np.ptp(df["T_C"]))               # a difference: degC == K
+            spread_P = float(np.ptp(df["P_mbar"])) / 1000.0
+            print(f"Gas cell: T = {T:.1f} K (range {spread_T:.2f} K), "
+                  f"P = {P:.5f} bar (range {spread_P:.5f} bar)")
+            if spread_T > 5.0 or spread_P > 0.02:
+                import warnings
+                warnings.warn(
+                    f"cell state varied by {spread_T:.1f} K / {spread_P:.3f} bar over "
+                    "the burn, beyond the range Appendix A5 tests as negligible. A "
+                    "single fixed reference matrix may not be adequate.", RuntimeWarning)
+            return P, T, dt
+
+    print("Warning: no PT log found; assuming 300 K, 1.01325 bar. The reference "
+          "spectra will be generated for the wrong cell state if this is not right.")
+    return 1.01325, 300.0, None
 
 
 def read_data(directory):
     """
-    Read all data from an experiment directory.
-    
-    This is the main data loading function. It reads spectral files,
-    pressure/temperature logs, and constructs a complete dataset.
-    
-    Parameters
-    ----------
-    directory : str or Path
-        Experiment directory containing:
-        - Spectra/ subdirectory with .prn files
-        - PT_Log.txt (optional)
-    
-    Returns
-    -------
-    spectra : np.ndarray
-        Spectral intensity array, shape (Nt, Nl)
-    w : np.ndarray
-        Wavenumber array (cm^-1), shape (Nl,)
-    P : float
-        Gas cell pressure in bar
-    T : float
-        Gas cell temperature in Kelvin
-    datetime : np.ndarray or None
-        Datetime array for each spectrum
-        
-    Example
-    -------
-    >>> spectra, wv, P, T, dt = read_data('/path/to/experiment')
-    >>> print(f"Loaded {len(spectra)} spectra at {T} K, {P} bar")
+    Read spectra and cell state from an experiment directory.
+
+    Also accepts a packed ``.npz`` archive written by
+    :func:`pyrospectra.pack_burn`, which is ~40x smaller than the raw .prn tree.
     """
-    # Read spectra
-    spectra_dir = os.path.join(directory, 'Spectra')
-    spectra, w = read_spectra(spectra_dir)
-    
-    # Read pressure and temperature
-    P, T, datetime = get_pt(directory)
-    
-    # If no datetime from PT log, create sequential array
-    if datetime is None:
-        datetime = np.arange(0, len(spectra), 1)
-    
-    return spectra, w, P, T, datetime
+    if str(directory).endswith(".npz"):
+        from .packing import read_packed
+        return read_packed(directory)
+    spectra, w = read_spectra(os.path.join(directory, "Spectra"))
+    P, T, dt = get_pt(directory)
+    if dt is None:
+        dt = np.arange(len(spectra))
+    return spectra, w, P, T, dt
 
 
-def get_compounds(file):
+def get_compounds(file=None, species=None, databank_overrides=None):
     """
-    Load compound definitions from a pickle file.
-    
-    The compound dictionary defines which species to look for and which
-    spectral windows to use for each species.
-    
-    Parameters
-    ----------
-    file : str or Path
-        Path to pickle file containing compound dictionary
-    
-    Returns
-    -------
-    dict
-        Compound dictionary with structure:
-        {
-            'CO2': {'bounds': [[2200, 2400], [3500, 3800]]},
-            'CO': {'bounds': [[2000, 2250]]},
-            ...
-        }
-        
-    Example
-    -------
-    >>> compounds = get_compounds('compounds.pkl')
-    >>> print(compounds['CO2']['bounds'])
-    [[2200, 2400], [3500, 3800]]
+    Load compound definitions.
+
+    With no argument, builds them from :mod:`pyrospectra.registry` (Table D1), which is
+    preferable to a pickle: the windows, databanks and molecule names stay under version
+    control and the file cannot silently drift from the manuscript.
     """
-    with open(file, 'rb') as handle:
+    if file is None:
+        from .registry import build_compounds
+        compounds = build_compounds(species=species,
+                                    databank_overrides=databank_overrides)
+        print(f"Built {len(compounds)} compound definitions from the registry")
+        return compounds
+    with open(file, "rb") as handle:
         compounds = pkl.load(handle)
-    
-    print(f"Loaded {len(compounds)} compound definitions")
+    print(f"Loaded {len(compounds)} compound definitions from {file}")
     return compounds
 
 
-def save_results(concentrations, uncertainties, species_list, datetime, 
-                result_dir, prefix=''):
+def align_datetime(datetime, lasso_score):
     """
-    Save concentration retrieval results.
-    
-    Parameters
-    ----------
-    concentrations : np.ndarray
-        Retrieved concentrations, shape (Ns*Nt,)
-    uncertainties : np.ndarray
-        1-σ uncertainties, shape (Ns*Nt,)
-    species_list : list
-        Names of species
-    datetime : np.ndarray
-        Datetime array for each timestep
-    result_dir : str or Path
-        Directory to save results
-    prefix : str, optional
-        Prefix for output files
-    
-    Notes
-    -----
-    Saves both numpy arrays and CSV file for easy analysis.
+    Restrict a datetime array to the time-steps that entered the retrieval.
+
+    ``lasso_inversion`` removes the sampled time-steps from the middle of the series;
+    the corresponding datetimes must be removed too, not truncated from the end.
     """
-    import os
+    dt = np.asarray(datetime)
+    kept = np.asarray(lasso_score["kept_timesteps"], dtype=int)
+    if kept.max(initial=-1) >= dt.size:
+        raise ValueError(
+            f"datetime has {dt.size} entries but the retrieval used time-step "
+            f"{kept.max()}. The PT log and the spectra directory are out of step.")
+    return dt[kept]
+
+
+def save_results(result, datetime=None, result_dir=".", prefix="",
+                 emission_result=None):
+    """
+    Save a :class:`~pyrospectra.inversion.RetrievalResult`.
+
+    Writes ``concentrations.npy`` / ``uncertainties.npy`` shaped (Nt, Ns), a tidy CSV
+    with paired ``<species>`` and ``<species>_sigma`` columns, and - if given - the
+    emission factor table.
+
+    v1.0 wrote ``concentrations.reshape(Ns, Nt, order='F').T``. The solver's output is
+    species-major, so that reshape transposes species against time; the saved CSV bore
+    the right column names over the wrong data.
+    """
     os.makedirs(result_dir, exist_ok=True)
-    
-    Ns = len(species_list)
-    Nt = len(datetime)
-    
-    # Reshape to (Nt, Ns)
-    conc_reshaped = concentrations.reshape(Ns, Nt, order='F').T
-    uncert_reshaped = uncertainties.reshape(Ns, Nt, order='F').T
-    
-    # Save as numpy arrays
-    np.save(f'{result_dir}/{prefix}concentrations.npy', conc_reshaped)
-    np.save(f'{result_dir}/{prefix}uncertainties.npy', uncert_reshaped)
-    
-    # Save as CSV
-    df = pd.DataFrame(conc_reshaped, columns=species_list)
-    df['datetime'] = datetime
-    df.to_csv(f'{result_dir}/{prefix}concentrations.csv', index=False)
-    
+    conc = np.asarray(result.concentrations)
+    unc = np.asarray(result.uncertainty)
+    species = list(result.species)
+
+    np.save(f"{result_dir}/{prefix}concentrations.npy", conc.T)
+    np.save(f"{result_dir}/{prefix}uncertainties.npy", unc.T)
+
+    df = result.to_frame(datetime=datetime)
+    df.to_csv(f"{result_dir}/{prefix}concentrations.csv", index=False)
+
+    meta = {"species": species, "gamma": result.gamma, "penalty": result.penalty,
+            "sigma_eps": result.sigma_eps, "effective_dof": result.effective_dof,
+            "condition_number": result.condition_number}
+    pd.Series(meta).to_json(f"{result_dir}/{prefix}retrieval_metadata.json", indent=2)
+
+    if emission_result is not None:
+        ef = pd.DataFrame({
+            "EF_g_per_kg": pd.Series(emission_result["EF"]),
+            "EF_standard_error": pd.Series(emission_result["EF_se"]),
+        })
+        ef.index.name = "species"
+        ef.to_csv(f"{result_dir}/{prefix}emission_factors.csv")
+
     print(f"Results saved to {result_dir}")
+    return df
+
+
+__all__ = ["read_data", "read_spectra", "read_spectrum", "get_compounds", "get_pt",
+           "save_results", "align_datetime"]

@@ -1,0 +1,23 @@
+{
+  "title": "PyroSpectra: Biomass Burning Emission Factors From Closed-Path FTIR Time Series Spectra",
+  "version": "2.0.0",
+  "description": "PyroSpectra retrieves trace-gas concentrations, emission ratios and emission factors from closed-path FTIR time-series spectra of biomass-burning smoke. Version 2.0 adds an optically-thick, high-concentration retrieval (thick_smoke) for close-to-source, undiluted smoke: full-spectrum pervasive absorbers (CO2 isotopologues, H2O, CO), a per-window non-negative continuum term, non-negative bounded least squares, optical-depth channel weighting, slope-based emission ratios with an optically-thin regime, and a 3-sigma detection framework with a carbon-plausibility bound; plus a publication-quality PDF diagnostics suite (spectral-fit atlas, excess-vs-CO2 hysteresis, Tikhonov L-curve and residual spectrum). The v1.1 temporal-regularisation retrieval is retained. Implements the methodology of Richardson-Foulger, Wooster, Gomez-Dans and Grosvenor (2026), JGR: Biogeosciences.",
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "creators": [
+    {"name": "Richardson-Foulger, Luke", "orcid": "0009-0006-8496-8300",
+     "affiliation": "Leverhulme Centre for Wildfires, Environment and Society, King's College London"},
+    {"name": "Wooster, Martin",
+     "affiliation": "NERC National Centre for Earth Observation (NCEO), King's College London"},
+    {"name": "Gomez-Dans, Jose", "orcid": "0000-0003-4787-8307",
+     "affiliation": "National Centre for Earth Observation"},
+    {"name": "Grosvenor, Mark",
+     "affiliation": "Leverhulme Centre for Wildfires, Environment and Society, King's College London"}
+  ],
+  "keywords": [
+    "FTIR spectroscopy", "fire emissions", "biomass burning", "emission factors",
+    "atmospheric chemistry", "Tikhonov regularization", "optically-thick smoke",
+    "detection limits", "RADIS", "HITRAN"
+  ]
+}

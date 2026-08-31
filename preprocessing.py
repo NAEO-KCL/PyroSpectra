@@ -1,226 +1,221 @@
 """
-Preprocessing Module
-
-Functions for spectral preprocessing including baseline correction,
-absorbance calculation, and matrix construction.
+Spectral preprocessing: baseline estimation, absorbance conversion, and the
+temporal difference operators used by the regularised retrieval.
 """
+
+import os
+import warnings
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
-import matplotlib.pyplot as plt
 
+
+# ---------------------------------------------------------------------------
+# Baseline
+# ---------------------------------------------------------------------------
 
 def get_baseline(y, lam=5e7, p=0.02, niter=10):
     """
-    Asymmetric Least Squares Smoothing (O-ALS) for baseline correction.
-    
-    This is a key preprocessing step that removes instrumental baseline drift
-    from FTIR spectra. The asymmetric weighting ensures baselines follow the
-    lower envelope of the spectrum.
-    
-    Parameters
-    ----------
-    y : np.ndarray
-        The spectrum data (intensity vs wavenumber)
-    lam : float, optional
-        Smoothness parameter. Higher values produce smoother baselines.
-        Default: 5e7
-    p : float, optional
-        Asymmetry parameter (0 < p < 1). Lower values make the baseline
-        follow the lower envelope more closely. Default: 0.02
-    niter : int, optional
-        Number of iterations for convergence. Default: 10
-    
-    Returns
-    -------
-    np.ndarray
-        The estimated baseline with same shape as input
-        
+    Optimised asymmetric least squares (O-ALS) baseline.
+
+    Minimises ``||W(y - z)||^2 + lam ||D2 z||^2`` with asymmetric weights, so the
+    baseline tracks the lower envelope of the spectrum.
+
+    Kept sparse throughout. v1.0 called ``.toarray()`` on the second-difference matrix
+    and used ``np.diag(w)``, so it allocated three dense (L, L) arrays: on the MG5 grid
+    (~29,900 channels between 800 and 8000 cm^-1 at 0.241 cm^-1) that is ~7 GB each and
+    the call cannot complete. The arithmetic below is identical; only the storage
+    differs.
+
     References
     ----------
-    Dong & Xu (2024). Baseline estimation using optimized asymmetric 
-    least squares (O-ALS). Measurement, 233, 114731.
+    Dong & Xu (2024), Measurement 233, 114731.
+    Eilers (2003), Analytical Chemistry 75(14), 3631-3636.
     """
-    L = len(y)
-    
-    # Construct second-order difference matrix for smoothness constraint
-    D = diags([1, -2, 1], [0, -1, -2], shape=(L, L)).toarray()
-    D = lam * np.dot(D.T, D)
-    
-    # Initialize weights uniformly
+    y = np.asarray(y, dtype=float)
+    L = y.size
+    if L < 3:
+        raise ValueError("spectrum too short for a second-difference baseline")
+
+    # Second-difference operator, (L-2, L), sparse.
+    D2 = sp.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(L - 2, L), format="csc")
+    DTD = lam * (D2.T @ D2)
+
     w = np.ones(L)
-    
-    # Iteratively reweight to fit baseline
-    for i in range(niter):
-        W = np.diag(w)
-        Z = sp.csc_matrix(W + D)
+    baseline = y.copy()
+    for _ in range(niter):
+        Z = (sp.diags(w, format="csc") + DTD).tocsc()
         baseline = spsolve(Z, w * y)
-        
-        # Asymmetric weighting: penalize points above baseline more heavily
         w = p * (y < baseline) + (1 - p) * (y > baseline)
-    
     return baseline
 
 
-def process_spectra(spectra, mask, result_dir):
+def estimate_background(spectra, n_preignition=None, lam=5e7, p=0.02, niter=10,
+                        reducer="median"):
     """
-    Process raw FTIR spectra to absorbance units with baseline correction.
-    
-    This function:
-    1. Applies O-ALS baseline correction to the first spectrum
-    2. Converts all spectra from transmittance to absorbance
-    3. Applies spectral windowing mask
-    4. Saves processed data for analysis
-    
+    Single-beam background I0 from the pre-ignition block.
+
+    Section A1 of the manuscript takes I0 from "the initial pre-ignition spectra -
+    recorded after gas cell conditions have stabilised". v1.0 used ``spectra[0]`` alone,
+    so I0 carried the full detector noise of one 4-second scan straight into every
+    absorbance in the burn. Averaging the stabilised pre-ignition block reduces that by
+    ~sqrt(n).
+
     Parameters
     ----------
-    spectra : np.ndarray
-        Raw spectra array, shape (Nt, Nl) where Nt is number of time steps
-        and Nl is number of wavenumbers
-    mask : np.ndarray
-        Boolean mask indicating which wavenumbers to keep (selected spectral windows)
-    result_dir : str or Path
-        Directory to save results and plots
-    
+    spectra : np.ndarray, shape (Nt, Nl)
+    n_preignition : int, optional
+        Number of leading spectra to combine. Default 1, i.e. v1.0 behaviour, so that
+        nothing changes unless you say how many pre-ignition scans you have.
+    reducer : {'median', 'mean'}
+
     Returns
     -------
-    observed_spectra : np.ndarray
-        Processed absorbance spectra with mask applied, shape (Nt, Nl_masked)
-    full_observed_spectra : np.ndarray
-        Full absorbance spectra without masking, shape (Nt, Nl)
-        
-    Notes
-    -----
-    Absorbance A is calculated as: A = -log10(I / I0)
-    where I is the measured intensity and I0 is the baseline.
+    np.ndarray, shape (Nl,)
     """
-    print('Processing Spectra')
-    
-    # Get baseline from first (pre-ignition) spectrum
-    baseline = get_baseline(spectra[0])
-    
-    # Convert to absorbance: A = -log10(I/I0)
-    full_observed_spectra = np.nan_to_num(-np.log10(spectra / baseline))
-    
-    # Save full spectra
-    np.save(f'{result_dir}/results/full_obs.npy', full_observed_spectra)
-    
-    # Apply spectral window mask
-    spectra_masked = np.array([s[mask] for s in spectra])
-    baseline_masked = np.array(baseline[mask])
-    
-    # Prevent division by zero
-    spectra_masked = np.where(spectra_masked == 0, 1e-10, spectra_masked)
-    
-    # Convert masked spectra to absorbance
-    observed_spectra = np.nan_to_num(-np.log10(spectra_masked / baseline_masked))
-    
-    # Plot processed spectra for quality control
-    _plot_spectra(observed_spectra, result_dir)
-    
-    return observed_spectra, full_observed_spectra
+    spectra = np.asarray(spectra, dtype=float)
+    n = 1 if n_preignition is None else int(n_preignition)
+    if n < 1 or n > spectra.shape[0]:
+        raise ValueError(f"n_preignition={n} outside 1..{spectra.shape[0]}")
+    if n == 1:
+        block = spectra[0]
+    else:
+        block = (np.median(spectra[:n], axis=0) if reducer == "median"
+                 else np.mean(spectra[:n], axis=0))
+    return get_baseline(block, lam=lam, p=p, niter=niter)
+
+
+def process_spectra(spectra, mask, result_dir, n_preignition=None,
+                    plot_every=None):
+    """
+    Convert raw single-beam spectra to decadic absorbance and apply the window mask.
+
+    ``A = -log10(I / I0)``, matching the decadic convention used for the reference
+    matrix (see :mod:`pyrospectra.conventions`).
+
+    Parameters
+    ----------
+    plot_every : int or None
+        Write a QC plot every N spectra. v1.0 wrote one PDF per timestep, which for a
+        666-spectrum burn is 666 files and dominates the runtime. Default None (no
+        plots); set e.g. 50 for a sample.
+
+    Returns
+    -------
+    observed_spectra : np.ndarray, shape (Nt, mask.sum())
+    full_observed_spectra : np.ndarray, shape (Nt, Nl)
+    """
+    print("Processing spectra")
+    spectra = np.asarray(spectra, dtype=float)
+    baseline = estimate_background(spectra, n_preignition=n_preignition)
+
+    safe_baseline = np.where(baseline <= 0, np.nan, baseline)
+    safe_spectra = np.where(spectra <= 0, np.nan, spectra)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        full_observed = np.nan_to_num(-np.log10(safe_spectra / safe_baseline))
+
+    os.makedirs(f"{result_dir}/results", exist_ok=True)
+    np.save(f"{result_dir}/results/full_obs.npy", full_observed)
+
+    observed = full_observed[:, mask]
+
+    if plot_every:
+        _plot_spectra(observed, result_dir, every=int(plot_every))
+    return observed, full_observed
+
+
+# ---------------------------------------------------------------------------
+# Temporal operators
+# ---------------------------------------------------------------------------
+
+def create_smoother(N):
+    """
+    The operator D of Appendix A4: the (N, N) second-difference matrix with reflecting
+    boundaries, so that ``(Dc)_t = 2 c_t - c_{t-1} - c_{t+1}``.
+
+    Note this is the *operator*, not the penalty. The penalty of Eq. 3 is ||Dc||^2,
+    which contributes ``gamma * D.T @ D`` to the normal equations. v1.0 added
+    ``gamma * D``. See :func:`penalty_matrix`.
+    """
+    D = 2 * np.eye(N) - np.eye(N, k=1) - np.eye(N, k=-1)
+    D[0, 0] = 1
+    D[N - 1, N - 1] = 1
+    return D
+
+
+def penalty_matrix(N, form="paper", sparse=True):
+    """
+    Temporal smoothness penalty contributed to the normal equations.
+
+    form='paper'  ->  D.T @ D  with D from :func:`create_smoother`.
+                      This is ||Dc||^2 exactly as written in Eq. 3 and Appendix A4:
+                      a penalty on curvature squared.
+
+    form='legacy' ->  D itself, reproducing PyroSpectra v1.0, which added
+                      ``lambda_ * D_mat`` rather than ``lambda_ * D^T D``. Because D is
+                      the path-graph Laplacian, c^T D c = sum_t (c_{t+1} - c_t)^2, so
+                      v1.0 in fact applied a *first-order* smoothness penalty - which is
+                      what the v1.0 README describes, and is a perfectly reasonable
+                      prior, but is one power of D away from Eq. 3.
+
+    The two are not on the same scale: gamma values are NOT transferable between them,
+    and the L-curve must be re-run when the form is changed. The corner sits at a
+    markedly different gamma for each.
+    """
+    D = create_smoother(N)
+    M = D.T @ D if form == "paper" else D if form == "legacy" else None
+    if M is None:
+        raise ValueError(f"Unknown penalty form {form!r}; use 'paper' or 'legacy'")
+    return sp.csc_matrix(M) if sparse else M
+
+
+def penalty_eigenvalues(N, form="paper"):
+    """
+    Eigen-decomposition of the temporal penalty, used by the fast exact solver.
+
+    D is symmetric, so ``D = U diag(nu) U^T`` and ``D^T D = U diag(nu^2) U^T`` share the
+    eigenvectors U. Returning (mu, U) for either form lets one solver cover both.
+    """
+    nu, U = np.linalg.eigh(create_smoother(N))
+    mu = nu ** 2 if form == "paper" else nu
+    return np.clip(mu, 0.0, None), U
 
 
 def build_A_matrix(spectra, Ns, Nl, Nt):
     """
-    Build the design matrix A for the linear inversion problem.
-    
-    For the linear model: y = A*x + ε, where y is the observed absorbance,
-    x is the concentrations we want to retrieve, and A encodes how each
-    species' reference spectrum contributes to the observation.
-    
-    Parameters
-    ----------
-    spectra : np.ndarray
-        Reference spectra for each species, shape (Ns, Nl)
-    Ns : int
-        Number of species
-    Nl : int
-        Number of wavenumbers (spectral channels)
-    Nt : int
-        Number of time steps
-    
-    Returns
-    -------
-    scipy.sparse matrix
-        Design matrix A of shape (Nl*Nt, Ns*Nt)
-        
-    Notes
-    -----
-    The matrix is constructed as a block-diagonal structure where each block
-    contains the reference spectrum for one species at one time step. This
-    allows time-varying concentrations to be retrieved.
+    Block design matrix A, shape (Nl*Nt, Ns*Nt), column-ordered species-major:
+    column ``i*Nt + j`` holds species i's reference at timestep j.
+
+    Retained for the L-curve helper and for tests. The production solver in
+    :mod:`pyrospectra.inversion` never forms A - it uses the identity
+    ``A^T A = kron(R R^T, I_Nt)`` and ``A^T y = R @ obs.T``.
     """
     S = []
-    
     for i in range(Ns):
-        # Create sparse matrix for species i
-        a = sp.lil_matrix((Nl * Nt, Nt), dtype=np.float32)
-        
-        # Fill in reference spectrum at each time step
+        a = sp.lil_matrix((Nl * Nt, Nt), dtype=np.float64)
         for j in range(Nt):
             a[(j * Nl):(j + 1) * Nl, j] = spectra[i, :].reshape(-1, 1)
-        
         S.append(a)
-    
-    # Horizontally stack all species matrices
-    return sp.hstack(S)
+    return sp.hstack(S).tocsc()
 
 
-def create_smoother(N):
-    """
-    Create a first-order difference matrix for temporal regularization.
-    
-    This matrix enforces smoothness in the time series by penalizing
-    rapid changes between consecutive time steps.
-    
-    Parameters
-    ----------
-    N : int
-        Length of the time series
-    
-    Returns
-    -------
-    np.ndarray
-        First-order difference matrix D of shape (N, N)
-        
-    Notes
-    -----
-    The matrix implements: (Dx)_t = x_{t+1} - x_t
-    Boundary conditions use reflection (first and last points treated specially).
-    """
-    # Standard first-order difference: D*x computes differences
-    D = 2 * np.eye(N) - np.eye(N, k=1) - np.eye(N, k=-1)
-    
-    # Boundary conditions: reflect at edges
-    D[0, 0] = 1      # First point
-    D[N - 1, N - 1] = 1  # Last point
-    
-    return D
-
-
-def _plot_spectra(spectra, result_dir):
-    """
-    Plot individual processed spectra for quality control.
-    
-    Parameters
-    ----------
-    spectra : np.ndarray
-        Processed absorbance spectra, shape (Nt, Nl)
-    result_dir : str
-        Directory to save plots
-    """
-    import os
-    os.makedirs(f'{result_dir}/processed_data', exist_ok=True)
-    
-    for i, spectrum in enumerate(spectra):
-        plt.figure(figsize=(10, 4))
-        plt.plot(spectrum)
-        plt.xlabel('Wavenumber Index')
-        plt.ylabel('Absorbance')
-        plt.title(f'Processed Spectrum {i}')
+def _plot_spectra(spectra, result_dir, every=50):
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+    os.makedirs(f"{result_dir}/processed_data", exist_ok=True)
+    for i in range(0, len(spectra), every):
+        plt.figure(figsize=(10, 3.2))
+        plt.plot(spectra[i], lw=0.6)
+        plt.xlabel("Fitted channel index")
+        plt.ylabel("Absorbance")
+        plt.title(f"Processed spectrum {i}")
         plt.tight_layout()
-        plt.savefig(f'{result_dir}/processed_data/{i}.pdf')
+        plt.savefig(f"{result_dir}/processed_data/{i}.png", dpi=110)
         plt.close()
+
+
+__all__ = ["get_baseline", "estimate_background", "process_spectra",
+           "create_smoother", "penalty_matrix", "penalty_eigenvalues",
+           "build_A_matrix"]
