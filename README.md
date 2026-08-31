@@ -190,6 +190,16 @@ python -m pytest pyrospectra/tests -v
 ## Citation
 
 ```bibtex
+
+ @misc{richardsonfoulger_gomezdans_2026, 
+    title={{PyroSpectra}: Biomass Burning Emission Factors From {FTIR} Time Series Spectra}, 
+    url={https://zenodo.org/records/18552195}, 
+    DOI={10.5281/zenodo.18552195}, 
+    abstractNote={A Python package for analysing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy, implementing temporally regularised concentration retrievals with automated species identification.}, 
+    publisher={Zenodo}, 
+    author={Richardson-Foulger, Luke and Gómez-Dans, José}, 
+    year={2026}}
+
 @article{richardsonfoulger2026ftir,
   title  = {Laboratory use of a Closed-Path 'Industrial Emissions' {FTIR} Spectrometer for High-Concentration Sampling of Biomass Burning Smoke and Retrieval of
             Fire Emission Factors},
@@ -197,8 +207,6 @@ python -m pytest pyrospectra/tests -v
             G{\'o}mez-Dans, Jos{\'e} and Grosvenor, Mark},
   journal= {Journal of Geophysical Research: Biogeosciences},
   year   = {2026}}
-
- @misc{richardsonfoulger_gomezdans_2026, title={{PyroSpectra}: Biomass Burning Emission Factors From {FTIR} Time Series Spectra}, url={https://zenodo.org/records/18552195}, DOI={10.5281/zenodo.18552195}, abstractNote={A Python package for analysing biomass burning emissions using closed-path Fourier Transform Infrared (FTIR) spectroscopy, implementing temporally regularised concentration retrievals with automated species identification.}, publisher={Zenodo}, author={Richardson-Foulger, Luke and Gómez-Dans, José}, year={2026}}
 
 ```
 
